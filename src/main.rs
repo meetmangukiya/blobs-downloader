@@ -1,7 +1,12 @@
+use beacon_node::beacon_chain::{
+    store::{HotColdDB, KeyValueStore, KeyValueStoreOp, LevelDB, StoreConfig},
+    types::{ChainSpec, EthSpec, Hash256, MainnetEthSpec},
+};
 use clap::Parser;
 use futures::future::TryJoinAll;
 use reqwest::StatusCode;
-use std::{error::Error, io::Write};
+use slog::{o, Drain};
+use std::{error::Error, io::Write, path::PathBuf, sync::Arc};
 
 mod types;
 use types::*;
@@ -19,6 +24,9 @@ struct Args {
 
     #[arg(short, long, default_value_t = 20)]
     concurrency: usize,
+
+    #[arg(short, long)]
+    data_dir: PathBuf,
 }
 
 fn get_url<'a>(base_url: &'a str, path: &'a str) -> String {
@@ -69,6 +77,17 @@ async fn get_current_headers(api_url: &str) -> anyhow::Result<BlockHeadersData> 
     Ok(data)
 }
 
+async fn get_block_root_for_slot(api_url: String, slot: usize) -> anyhow::Result<String> {
+    let data = reqwest::get(get_url(
+        &api_url,
+        format!("eth/v1/beacon/headers/{slot}").as_str(),
+    ))
+    .await?
+    .json::<SingleBlockHeaderData>()
+    .await?;
+    Ok(data.data.root)
+}
+
 async fn get_current_slot_number(api_url: &str) -> anyhow::Result<usize> {
     get_current_headers(api_url)
         .await?
@@ -95,6 +114,20 @@ fn write_data(data: &[BlobsDataToWrite]) -> anyhow::Result<()> {
 
 const DANCUN_SLOT: usize = 8626176;
 
+fn write_blobs<E: EthSpec>(
+    store: Arc<HotColdDB<E, LevelDB<E>, LevelDB<E>>>,
+    data: &[BlobsDataToWrite],
+) -> anyhow::Result<()> {
+    let mut batch = vec![];
+    data.iter()
+        .for_each(|x| store.blobs_as_kv_store_ops(&x.root, Into::<_>::into(x), &mut batch));
+    store
+        .blobs_db
+        .do_atomically(batch)
+        .expect("writing blobs to do failed");
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -117,9 +150,30 @@ async fn main() -> anyhow::Result<()> {
     };
     let concurrency = args.concurrency;
     let n_slots = to_slot - from_slot;
+    let data_dir = args.data_dir;
+
+    let decorator = slog_term::TermDecorator::new().build();
+    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog_async::Async::new(drain).build().fuse();
+    let logger = slog::Logger::root(drain, o!());
+
+    let store = HotColdDB::open(
+        &data_dir.join("chain_db"),
+        &data_dir.join("freezer_db"),
+        &data_dir.join("blobs_db"),
+        |_: Arc<HotColdDB<MainnetEthSpec, LevelDB<_>, LevelDB<_>>>, _, _| Ok(()),
+        StoreConfig {
+            prune_blobs: false,
+            ..Default::default()
+        },
+        ChainSpec::mainnet(),
+        logger,
+    )
+    .unwrap();
 
     for slot in (from_slot..=to_slot).step_by(concurrency) {
         let mut handles = vec![];
+        let mut root_handles = vec![];
 
         for slot in slot..(slot + concurrency) {
             handles.push(tokio::spawn(download_blob_sidecars(
@@ -128,26 +182,51 @@ async fn main() -> anyhow::Result<()> {
                 10,
                 5000,
             )));
+            root_handles.push(tokio::spawn(get_block_root_for_slot(
+                api_url.to_string(),
+                slot,
+            )));
         }
 
         let join_handles = handles.into_iter().collect::<TryJoinAll<_>>();
-        let (val,) = tokio::join!(join_handles);
+        let root_handles = root_handles.into_iter().collect::<TryJoinAll<_>>();
+        let (val, roots) = tokio::join!(join_handles, root_handles);
         let val = val?
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|item| BlobsDataToWrite {
+            .collect::<Vec<_>>();
+        let roots = roots?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|x| x.parse::<Hash256>())
+            .collect::<Result<Vec<_>, _>>()?;
+        println!("roots: {:?}", roots);
+        let val = roots
+            .into_iter()
+            .zip(val.into_iter())
+            .map(|(root, data)| BlobsDataToWrite {
                 slot,
-                data: item.data,
+                data: data.data,
+                root,
             })
             .collect::<Vec<_>>();
+        println!("writing blobs to level db now");
+        // .map(|item| BlobsDataToWrite {
+        //     slot,
+        //     data: item.data,
+        // })
 
-        write_data(&val[..])?;
+        // write_data(&val[..])?;
+        write_blobs(store.clone(), &val[..])?;
         println!(
             "blobs downloaded for {slot}..{} [{}%]",
             slot + concurrency,
             (slot - from_slot) as f64 / (n_slots as f64) * 100.0
         );
+
+        break;
     }
 
     Ok(())
