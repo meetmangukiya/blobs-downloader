@@ -50,6 +50,7 @@ async fn download_blob_sidecars(
             continue;
         };
         let data = data?;
+        // NOT_FOUND is returned when the proposer of given slot missed to propose the block
         if let StatusCode::NOT_FOUND = data.status() {
             return Ok(BlobSidecarsResponse { data: vec![] });
         }
@@ -92,10 +93,20 @@ fn write_data(data: &[BlobsDataToWrite]) -> anyhow::Result<()> {
     Ok(())
 }
 
+const DANCUN_SLOT: usize = 8626176;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let from_slot = args.from_slot;
+    let from_slot = if args.from_slot < DANCUN_SLOT {
+        println!(
+            "warn: using {DANCUN_SLOT} instead of {} since blobs didnt exist before that slot",
+            args.from_slot
+        );
+        DANCUN_SLOT
+    } else {
+        args.from_slot
+    };
     let api_url = &args.api_url;
     let to_slot = if let Some(slot) = args.to_slot {
         slot
