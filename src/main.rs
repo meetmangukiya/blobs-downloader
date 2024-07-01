@@ -82,9 +82,11 @@ async fn get_block_root_for_slot(api_url: String, slot: usize) -> anyhow::Result
         &api_url,
         format!("eth/v1/beacon/headers/{slot}").as_str(),
     ))
-    .await?
-    .json::<SingleBlockHeaderData>()
     .await?;
+    if let StatusCode::NOT_FOUND = data.status() {
+        return Ok("".to_string());
+    }
+    let data = data.json::<SingleBlockHeaderData>().await?;
     Ok(data.data.root)
 }
 
